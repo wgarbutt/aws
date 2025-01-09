@@ -1,7 +1,9 @@
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'CloudFormation template to set up SSM access, including VPC endpoints, IAM roles, and security group rules'
 
 Parameters:
+# Makes some nice dropdowns of existing resources instead of having to go off searching for the IDs
   VpcId:
     Type: List<AWS::EC2::VPC::Id>
     Description: The VPC ID where the resources will be created
@@ -20,37 +22,49 @@ Resources:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
-      VpcId: !Ref VpcId
+      VpcId: !Select [0, !Ref VpcId]  # Need to make sure we convert to an array because it wants that for some reason
       VpcEndpointType: Interface
+      PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds: 
-        - !Ref SecurityGroupId
+        - !Select [0, !Ref SecurityGroupId]
+      Tags:
+      - Key: Name
+        Value: SSM-Endpoint
 
   SSMMessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
-      VpcId: !Ref VpcId
+      VpcId: !Select [0, !Ref VpcId] # Need to make sure we convert to an array because it wants that for some reason, again
       VpcEndpointType: Interface
+      PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds: 
-        - !Ref SecurityGroupId
+        - !Select [0, !Ref SecurityGroupId]
+      Tags:
+      - Key: Name
+        Value: SSM-Messages-Endpoint
 
   EC2MessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
-      VpcId: !Ref VpcId
+      VpcId: !Select [0, !Ref VpcId] # Need to make sure we convert to an array because it wants that for some reason, again, again.
       VpcEndpointType: Interface
+      PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds: 
-        - !Ref SecurityGroupId
+        - !Select [0, !Ref SecurityGroupId]
+      Tags:
+      - Key: Name
+        Value: SSM-EC2Messages-Endpoint
 
   # IAM Role for SSM
   SSMIAMRole:
     Type: AWS::IAM::Role
     Properties:
-      Name: SSMAccessRole
+      RoleName: SSM-Access-Role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -60,28 +74,38 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: SSM Access Role
+
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: SSM-Instance-Profile
+      Path: "/"
+      Roles: 
+        - !Ref SSMIAMRole
 
   # Security Group Rule
   SSMSecurityGroupRule:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      GroupId: !Ref SecurityGroupId
+      GroupId: !Select [0, !Ref SecurityGroupId]
       IpProtocol: tcp
       FromPort: 443
       ToPort: 443
-      SourceSecurityGroupId: !Ref SecurityGroupId
+      SourceSecurityGroupId: !Select [0, !Ref SecurityGroupId]
 
-  RDPSecurityGroupRule:
+  RDPSecurityGroupRule: # For RDP access, because im a Windows guy
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      GroupId: !Ref SecurityGroupId
+      GroupId: !Select [0, !Ref SecurityGroupId]
       IpProtocol: tcp
       FromPort: 3389
       ToPort: 3389
-      SourceSecurityGroupId: !Ref SecurityGroupId
+      SourceSecurityGroupId: !Select [0, !Ref SecurityGroupId]
 
 Outputs:
   SSMIAMRoleArn:
     Description: ARN of the IAM Role created for SSM
     Value: !GetAtt SSMIAMRole.Arn
-
