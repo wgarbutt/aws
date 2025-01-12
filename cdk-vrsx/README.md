@@ -173,8 +173,9 @@ subnet_config = [
 ```
 
 **Deploying the CDK**
+``` powershell
 cdk bootstrap --profile (PROFILE NAME)
 cdk deploy vSRX-Parameter-Stack --profile (PROFILE NAME) --require-approval never  
 cdk deploy --all --profile (PROFILE NAME) --require-approval never  
-
+```
 
