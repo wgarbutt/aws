@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ""
+Resources:
+    WebsiteBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            AccessControl: PublicRead
+            BucketName: "will-garbutt.me"
+            WebsiteConfiguration: 
+                IndexDocument: "index.html"
+                ErrorDocument: "error.html"
+
+    PipelineBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: "will-garbutt.me-codepipeline-artifacts"
+
+    WWWBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: "www.will-garbutt.me"
+            WebsiteConfiguration: 
+              RedirectAllRequestsTo:
+                 HostName: will-garbutt.me
+                 Protocol: https
+
+    WebsiteBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: will-garbutt.me
+            PolicyDocument: 
+                Version: "2012-10-17"
+                Statement: 
+                  - Action: 
+                      - "s3:GetObject"
+                    Effect: Allow
+                    Principal: "*"
+                    Resource: 
+                    -  "arn:aws:s3:::will-garbutt.me"
+                    -  "arn:aws:s3:::will-garbutt.me/*"
+
+    CodePipelinePipeline:
+        Type: "AWS::CodePipeline::Pipeline"
+        Properties:
+            Name: "Cloud-resume-deploy"
+            RoleArn: "arn:aws:iam::337461354076:role/service-role/Codepipeline-Role"
+            ArtifactStore: 
+                Location: !Ref PipelineBucket
+                Type: "S3"
+            Stages: 
+              - 
+                Name: "Source"
+                Actions: 
+                  - 
+                    Name: "Source"
+                    ActionTypeId: 
+                        Category: "Source"
+                        Owner: "AWS"
+                        Provider: "CodeStarSourceConnection"
+                        Version: "1"
+                    Configuration: 
+                        BranchName: "main"
+                        ConnectionArn: !Ref GitHubConnection
+                        FullRepositoryId: "wgarbutt/CloudResume"
+                        OutputArtifactFormat: "CODE_ZIP"
+                    OutputArtifacts: 
+                      - 
+                        Name: "SourceArtifact"
+                    Region: !Ref AWS::Region
+                    RunOrder: 1
+              - 
+                Name: "Deploy"
+                Actions: 
+                  - 
+                    Name: "Deploy"
+                    ActionTypeId: 
+                        Category: "Deploy"
+                        Owner: "AWS"
+                        Provider: "S3"
+                        Version: "1"
+                    Configuration: 
+                        BucketName: "will-garbutt.me"
+                        Extract: "true"
+                    InputArtifacts: 
+                      - 
+                        Name: "SourceArtifact"
+                    Region: !Ref AWS::Region
+                    RunOrder: 1
+
+    GitHubConnection:
+     Type: 'AWS::CodeStarConnections::Connection'
+     Properties:
+      ConnectionName: 'GitHub'
+      ProviderType: GitHub
+
+    VisitorCountTable:
+     Type: AWS::DynamoDB::Table
+     Properties:
+      AttributeDefinitions: 
+        -
+          AttributeName: "record_id"
+          AttributeType: "S"
+      TableName: "Visitor_Count"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      KeySchema: 
+        - 
+          AttributeName: "record_id"
+          KeyType: "HASH"
+
+    LambdaGetVisitor:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "CloudResumeGetVisitor"
+            Handler: "getvisitor.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code:
+              S3Bucket: "cloudresumelambdafunctions"
+              S3Key: "getvisitor.zip"
+
+            Role: "arn:aws:iam::337461354076:role/CloudResume-LambdaFunctions"
+            Runtime: "python3.9"
+
+    LambdaAddVisitor:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "CloudResumeAddVisitor"
+            Handler: "addvisitor.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code:
+              S3Bucket: "cloudresumelambdafunctions"
+              S3Key: "addvisitor.zip"
+
+            Role: "arn:aws:iam::337461354076:role/CloudResume-LambdaFunctions"
+            Runtime: "python3.9"
+
+    ApiGateway:
+        Type: "AWS::ApiGateway::RestApi"
+        Properties:
+            Name: "visitors"
+            ApiKeySourceType: "HEADER"
+            EndpointConfiguration: 
+                Types: 
+                  - "REGIONAL"
+
+    ApiGatewayGet:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGateway
+            ResourceId: !GetAtt ApiGateway.RootResourceId
+            HttpMethod: "GET"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            RequestParameters: {}
+            MethodResponses: 
+              - 
+                ResponseModels: 
+                    "application/json": "Empty"
+                StatusCode: "200"
+            Integration: 
+                CacheNamespace: !GetAtt ApiGateway.RootResourceId
+                ContentHandling: "CONVERT_TO_TEXT"
+                IntegrationHttpMethod: "POST"
+                IntegrationResponses: 
+                  - 
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                TimeoutInMillis: 29000
+                Type: "AWS"
+                Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaGetVisitor}/invocations"
+
+    ApiGatewayPost:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            RestApiId: !Ref ApiGateway
+            ResourceId: !GetAtt ApiGateway.RootResourceId
+            HttpMethod: "POST"
+            AuthorizationType: "NONE"
+            ApiKeyRequired: false
+            RequestParameters: {}
+            MethodResponses: 
+              - 
+                ResponseModels: 
+                    "application/json": "Empty"
+                StatusCode: "200"
+            Integration: 
+                CacheNamespace: !GetAtt ApiGateway.RootResourceId
+                ContentHandling: "CONVERT_TO_TEXT"
+                IntegrationHttpMethod: "POST"
+                IntegrationResponses: 
+                  - 
+                    ResponseTemplates: {}
+                    StatusCode: "200"
+                PassthroughBehavior: "WHEN_NO_MATCH"
+                TimeoutInMillis: 29000
+                Type: "AWS"
+                Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaAddVisitor}/invocations"
+     
+    APIGetPermissions:
+        Type: AWS::Lambda::Permission
+        Properties:
+          Action: "lambda:InvokeFunction"
+          FunctionName: !Ref LambdaGetVisitor
+          Principal: "apigateway.amazonaws.com"
+          SourceArn: arn:aws:execute-api:ap-southeast-2:337461354076:5cabfxax81/*/GET/
+
+    APIPostPermissions:
+        Type: AWS::Lambda::Permission
+        Properties:
+          Action: "lambda:InvokeFunction"
+          FunctionName: !Ref LambdaAddVisitor
+          Principal: "apigateway.amazonaws.com"
+          SourceArn: arn:aws:execute-api:ap-southeast-2:337461354076:5cabfxax81/*/POST/
+
