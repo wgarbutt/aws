@@ -1,4 +1,4 @@
-# AWS Security Group Ingress Guard
+# AWS Security Group Ingress Enforcer
 
 Automatically prevents overly permissive Security Group rules in AWS.
 
