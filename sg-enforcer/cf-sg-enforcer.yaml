@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Enforce SG ingress policy - revoke overly permissive rules unless SG is allowed via tag. 
+
+Parameters:
+  AllowTagKey:
+    Type: String
+    Default: PublicApproved
+    Description: SG tag key that allows the security group to bypass enforcement.
+
+  AllowTagValue:
+    Type: String
+    Default: "true"
+    Description: SG tag value that allows the security group to bypass enforcement
+
+  EnforceAllPorts:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: If true, revoke any overly permissive ingress on any port unless allowlisted. If false, only revoke ports in DenyPortsCsv.
+
+  DenyPortsCsv:
+    Type: String
+    Default: "22,3389"
+    Description: Comma-separated list of ports to revoke when overly permissive and not allowlisted (used when EnforceAllPorts=false).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1,3,5,7,14,30,60,90,120,150,180,365,400,545,731,1827,3653]
+    Description: CloudWatch Logs retention for the Lambda log group.
+
+  MaxEventAgeSeconds:
+    Type: Number
+    Default: 600
+    Description: EventBridge target max event age in seconds (e.g. 600 = 10 minutes).
+
+  MaxRetryAttempts:
+    Type: Number
+    Default: 8
+    Description: EventBridge target retry attempts.
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional. If set, creates an SNS email subscription (confirm via email).
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  # -------- SNS --------
+  SgIngressEnforcerTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sg-ingress-enforcer-${AWS::StackName}"
+
+  SgIngressEnforcerTopicSubscriptionEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref SgIngressEnforcerTopic
+
+  # -------- SQS DLQ (for EventBridge target failures) --------
+  SgIngressEnforcerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "sg-ingress-enforcer-dlq-${AWS::StackName}"
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  SgIngressEnforcerDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SgIngressEnforcerDLQ
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeToSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SgIngressEnforcerDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt SgIngressEnforcerRule.Arn
+
+  # -------- IAM / Lambda --------
+  SgIngressEnforcerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sg-ingress-enforcer-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sg-ingress-enforcer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SgIngressEnforcerTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+  SgIngressEnforcerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sg-ingress-enforcer-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SgIngressEnforcerRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          ALLOW_TAG_KEY: !Ref AllowTagKey
+          ALLOW_TAG_VALUE: !Ref AllowTagValue
+          ENFORCE_ALL_PORTS: !Ref EnforceAllPorts
+          DENY_PORTS_CSV: !Ref DenyPortsCsv
+          SNS_TOPIC_ARN: !Ref SgIngressEnforcerTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime
+
+          ec2 = boto3.client("ec2")
+          sns = boto3.client("sns")
+
+          WORLD_V4 = "0.0.0.0/0"
+          WORLD_V6 = "::/0"
+
+          ALLOW_TAG_KEY = os.getenv("ALLOW_TAG_KEY", "PublicApproved")
+          ALLOW_TAG_VALUE = os.getenv("ALLOW_TAG_VALUE", "true").lower()
+
+          ENFORCE_ALL_PORTS = os.getenv("ENFORCE_ALL_PORTS", "false").lower() == "true"
+
+          def parse_ports(csv_str: str) -> set[int]:
+              out = set()
+              for p in (csv_str or "").split(","):
+                  p = p.strip()
+                  if not p:
+                      continue
+                  try:
+                      out.add(int(p))
+                  except ValueError:
+                      pass
+              return out
+
+          DENY_PORTS = parse_ports(os.getenv("DENY_PORTS_CSV", "22,3389"))
+          SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "")
+
+          def notify(subject: str, message: dict):
+              if not SNS_TOPIC_ARN:
+                  return
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=subject[:100],
+                  Message=json.dumps(message, default=str, indent=2)
+              )
+
+          def has_allow_tag(group_id: str) -> bool:
+              resp = ec2.describe_security_groups(GroupIds=[group_id])
+              sgs = resp.get("SecurityGroups", [])
+              if not sgs:
+                  return False
+              tags = {t.get("Key"): (t.get("Value") or "") for t in sgs[0].get("Tags", [])}
+              return (tags.get(ALLOW_TAG_KEY, "").lower() == ALLOW_TAG_VALUE)
+
+          def port_in_scope(from_port, to_port) -> bool:
+              if ENFORCE_ALL_PORTS:
+                  return True
+              if from_port is None or to_port is None:
+                  # If we're not enforcing all ports, ignore non-port rules unless you want otherwise.
+                  return False
+              pr = range(int(from_port), int(to_port) + 1)
+              return any(p in DENY_PORTS for p in pr)
+
+          def build_revoke_from_ip_permissions(ip_permissions_items):
+              """
+              ipPermissions.items[] shape from AuthorizeSecurityGroupIngress
+              """
+              revoke_permissions = []
+
+              for perm in ip_permissions_items:
+                  proto = perm.get("ipProtocol")
+                  from_port = perm.get("fromPort")
+                  to_port = perm.get("toPort")
+
+                  ip_ranges = (perm.get("ipRanges", {}) or {}).get("items", [])
+                  ipv6_ranges = (perm.get("ipv6Ranges", {}) or {}).get("items", [])
+
+                  has_world_v4 = any(r.get("cidrIp") == WORLD_V4 for r in ip_ranges)
+                  has_world_v6 = any(r.get("cidrIpv6") == WORLD_V6 for r in ipv6_ranges)
+
+                  if not (has_world_v4 or has_world_v6):
+                      continue
+
+                  # Handle "all traffic" (-1) which has no ports
+                  if proto == "-1" or from_port is None or to_port is None:
+                      if not ENFORCE_ALL_PORTS:
+                          # Conservative default: only revoke non-port rules when enforcing all ports
+                          continue
+                      revoke_perm = {"IpProtocol": "-1"}
+                      if has_world_v4:
+                          revoke_perm["IpRanges"] = [{"CidrIp": WORLD_V4}]
+                      if has_world_v6:
+                          revoke_perm["Ipv6Ranges"] = [{"CidrIpv6": WORLD_V6}]
+                      revoke_permissions.append(revoke_perm)
+                      continue
+
+                  if not port_in_scope(from_port, to_port):
+                      continue
+
+                  revoke_perm = {
+                      "IpProtocol": proto,
+                      "FromPort": int(from_port),
+                      "ToPort": int(to_port),
+                  }
+                  if has_world_v4:
+                      revoke_perm["IpRanges"] = [{"CidrIp": WORLD_V4}]
+                  if has_world_v6:
+                      revoke_perm["Ipv6Ranges"] = [{"CidrIpv6": WORLD_V6}]
+                  revoke_permissions.append(revoke_perm)
+
+              return revoke_permissions
+
+          def build_revoke_from_security_group_rules(sg_rules_items):
+              """
+              securityGroupRules.items[] shape from ModifySecurityGroupRules (best-effort)
+              We convert rules -> IpPermissions for revoke.
+              """
+              revoke_permissions = []
+
+              for r in sg_rules_items:
+                  # Only ingress
+                  if r.get("isEgress") is True:
+                      continue
+
+                  proto = str(r.get("ipProtocol"))
+                  from_port = r.get("fromPort")
+                  to_port = r.get("toPort")
+
+                  cidr_v4 = r.get("cidrIpv4")
+                  cidr_v6 = r.get("cidrIpv6")
+
+                  has_world_v4 = (cidr_v4 == WORLD_V4)
+                  has_world_v6 = (cidr_v6 == WORLD_V6)
+
+                  if not (has_world_v4 or has_world_v6):
+                      continue
+
+                  # all traffic
+                  if proto == "-1" or from_port is None or to_port is None:
+                      if not ENFORCE_ALL_PORTS:
+                          continue
+                      revoke_perm = {"IpProtocol": "-1"}
+                      if has_world_v4:
+                          revoke_perm["IpRanges"] = [{"CidrIp": WORLD_V4}]
+                      if has_world_v6:
+                          revoke_perm["Ipv6Ranges"] = [{"CidrIpv6": WORLD_V6}]
+                      revoke_permissions.append(revoke_perm)
+                      continue
+
+                  if not port_in_scope(from_port, to_port):
+                      continue
+
+                  revoke_perm = {
+                      "IpProtocol": proto,
+                      "FromPort": int(from_port),
+                      "ToPort": int(to_port),
+                  }
+                  if has_world_v4:
+                      revoke_perm["IpRanges"] = [{"CidrIp": WORLD_V4}]
+                  if has_world_v6:
+                      revoke_perm["Ipv6Ranges"] = [{"CidrIpv6": WORLD_V6}]
+                  revoke_permissions.append(revoke_perm)
+
+              return revoke_permissions
+
+          def lambda_handler(event, context):
+              detail = event.get("detail", {}) or {}
+              event_name = detail.get("eventName", "unknown")
+              rp = detail.get("requestParameters", {}) or {}
+
+              group_id = rp.get("groupId") or rp.get("GroupId")  # handle possible casing differences
+
+              actor_arn = (detail.get("userIdentity", {}) or {}).get("arn", "unknown")
+              region = event.get("region") or detail.get("awsRegion")
+              source_ip = detail.get("sourceIPAddress")
+              when = detail.get("eventTime") or event.get("time") or datetime.utcnow().isoformat()
+
+              # Only care about these events
+              if event_name not in ("AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules"):
+                  return {"ok": True, "skipped": f"eventName={event_name}"}
+
+              if not group_id:
+                  print(f"SKIP: {event_name} missing groupId. rp keys={list(rp.keys())}")
+                  return {"ok": True, "skipped": "missing groupId"}
+
+              # Allowlist check
+              if has_allow_tag(group_id):
+                  print(f"ALLOW: {group_id} has {ALLOW_TAG_KEY}={ALLOW_TAG_VALUE}")
+                  return {"ok": True, "allowed": True, "groupId": group_id}
+
+              revoke_permissions = []
+
+              if event_name == "AuthorizeSecurityGroupIngress":
+                  ip_permissions = (rp.get("ipPermissions", {}) or {}).get("items", [])
+                  revoke_permissions = build_revoke_from_ip_permissions(ip_permissions)
+
+              elif event_name == "ModifySecurityGroupRules":
+                  # Best-effort parse; actual shape can vary by call type
+                  sg_rules = None
+                  if isinstance(rp.get("securityGroupRules"), dict):
+                      sg_rules = (rp.get("securityGroupRules", {}) or {}).get("items", [])
+                  elif isinstance(rp.get("SecurityGroupRules"), dict):
+                      sg_rules = (rp.get("SecurityGroupRules", {}) or {}).get("items", [])
+                  elif isinstance(rp.get("securityGroupRuleSet"), dict):
+                      sg_rules = (rp.get("securityGroupRuleSet", {}) or {}).get("items", [])
+
+                  sg_rules = sg_rules or []
+                  revoke_permissions = build_revoke_from_security_group_rules(sg_rules)
+
+              if not revoke_permissions:
+                  print(f"NO ACTION: groupId={group_id} event={event_name} (not allowlisted, but nothing offending found)")
+                  return {"ok": True, "revoked": 0, "groupId": group_id}
+
+              print(f"REVOKE: groupId={group_id} event={event_name} actor={actor_arn} revoke={json.dumps(revoke_permissions)}")
+
+              ec2.revoke_security_group_ingress(GroupId=group_id, IpPermissions=revoke_permissions)
+
+              notify(
+                  subject=f"SG ingress revoked in {region}",
+                  message={
+                      "action": "REVOKED_WORLD_OPEN_INGRESS",
+                      "groupId": group_id,
+                      "eventName": event_name,
+                      "actorArn": actor_arn,
+                      "sourceIp": source_ip,
+                      "time": when,
+                      "allowTag": f"{ALLOW_TAG_KEY}={ALLOW_TAG_VALUE}",
+                      "enforceAllPorts": ENFORCE_ALL_PORTS,
+                      "denyPorts": sorted(list(DENY_PORTS)),
+                      "revokedIpPermissions": revoke_permissions,
+                  }
+              )
+
+              return {"ok": True, "revoked": len(revoke_permissions), "groupId": group_id}
+
+  SgIngressEnforcerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SgIngressEnforcerFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # -------- EventBridge --------
+  SgIngressEnforcerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "sg-ingress-enforcer-rule-${AWS::StackName}"
+      Description: Trigger Lambda on SG ingress add/modify events (CloudTrail).
+      EventPattern:
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        source:
+          - "aws.ec2"
+        detail:
+          eventSource:
+            - "ec2.amazonaws.com"
+          eventName:
+            - "AuthorizeSecurityGroupIngress"
+            - "ModifySecurityGroupRules"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SgIngressEnforcerFunction.Arn
+          Id: "SgIngressEnforcerLambda"
+          RetryPolicy:
+            MaximumEventAgeInSeconds: !Ref MaxEventAgeSeconds
+            MaximumRetryAttempts: !Ref MaxRetryAttempts
+          DeadLetterConfig:
+            Arn: !GetAtt SgIngressEnforcerDLQ.Arn
+
+  AllowEventBridgeInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SgIngressEnforcerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt SgIngressEnforcerRule.Arn
+
+Outputs:
+  LambdaName:
+    Value: !Ref SgIngressEnforcerFunction
+  EventRuleName:
+    Value: !Ref SgIngressEnforcerRule
+  DLQName:
+    Value: !GetAtt SgIngressEnforcerDLQ.QueueName
+  SNSTopicArn:
+    Value: !Ref SgIngressEnforcerTopic
+  AllowlistTag:
+    Value: !Sub "${AllowTagKey}=${AllowTagValue}"
